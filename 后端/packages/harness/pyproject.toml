@@ -1,0 +1,17 @@
+[project]
+name = "agent-memory-harness"
+version = "0.1.0"
+description = "agent-memory experiment harness: replay driver, metrics, report"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["agent-memory-core", "agent-memory-cli", "agent-memory-executor"]
+
+[project.scripts]
+mem-exp = "agent_memory.harness.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_memory"]

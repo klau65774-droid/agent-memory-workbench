@@ -1,0 +1,313 @@
+"""Hook entry point. It captures and triggers; it decides nothing and it never fails loudly.
+
+A hook that breaks its host is worse than a hook that never fires, so every path here ends
+in exit code 0 and any trouble goes to the store's own log.
+"""
+
+from __future__ import annotations
+
+import _thread
+import argparse
+import contextlib
+import json
+import os
+import pathlib
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import traceback
+from collections.abc import Callable, Iterator, Sequence
+from types import FrameType
+
+from agent_memory.core import injection, stdio
+from agent_memory.core.config import (
+    EXECUTOR_ENV_VAR,
+    MUSE_SETTINGS_ENV_VAR,
+    STORE_ENV_VAR,
+)
+from agent_memory.core.store import Store
+from agent_memory.core.write_jobs import WriteJobs
+
+from . import capture as capture_module
+from . import detached, moments, muse_session, transcript
+
+EXIT_OK = 0
+LOG_FILENAME = "hooks.log"
+KEY_SESSION = "session_id"
+KEY_TRANSCRIPT = "transcript_path"
+KEY_EVENT_CLAUDE = "hook_event_name"
+KEY_EVENT_GENERIC = "event"
+KEY_HOST = "host"
+KEY_ITEMS = "items"
+KEY_MUSE_DATA_HOME = "muse_data_home"
+KEY_MUSE_SETTINGS = "muse_settings"
+CLAUDE_OUTPUT_KEY = "hookSpecificOutput"
+CLAUDE_CONTEXT_KEY = "additionalContext"
+CLAUDE_EVENT_OUTPUT_KEY = "hookEventName"
+KEY_DISTILL = "distill"
+DISTILL_LAUNCHED = "launched"
+DISTILL_SKIPPED = "skipped"
+SOURCE_HOST_FLAG = "--source-host"
+HOST_FLAG = "--host"
+STORE_FLAG = "--store"
+MUSE_DATA_HOME_FLAG = "--muse-data-home"
+MUSE_SETTINGS_FLAG = "--muse-settings"
+EXECUTOR_BINARY = "mem"
+AUTO_DREAM_FLAG = "--auto-dream"
+JOB_FLAG = "--job"
+PRINTED_KEYS = (CLAUDE_OUTPUT_KEY, CLAUDE_CONTEXT_KEY)
+TRIGGER_SOURCE_HOOK = "hook"
+
+Launcher = Callable[[Store, str, str], bool]
+DreamLauncher = Callable[[Store, str], object]
+DrainLauncher = Callable[[Store], object]
+
+
+class _Timeout(Exception):
+    pass
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Hooks fired by the executor's own host session stand down, or distillation recurses."""
+    if os.environ.get(EXECUTOR_ENV_VAR):
+        return EXIT_OK
+    stdio.use_utf8()
+    store: Store | None = None
+    try:
+        parser = argparse.ArgumentParser(prog="mem-hook")
+        parser.add_argument(HOST_FLAG, default=moments.HOST_CLAUDE_CODE)
+        parser.add_argument(STORE_FLAG, default="")
+        parser.add_argument(MUSE_DATA_HOME_FLAG, default="")
+        parser.add_argument(MUSE_SETTINGS_FLAG, default="")
+        args = parser.parse_args(argv or ())
+        event = normalize_event(json.loads(sys.stdin.read() or "{}"), args.host)
+        if args.store:
+            event["store"] = args.store
+        if args.muse_data_home:
+            event[KEY_MUSE_DATA_HOME] = args.muse_data_home
+        if args.muse_settings:
+            event[KEY_MUSE_SETTINGS] = args.muse_settings
+            os.environ[MUSE_SETTINGS_ENV_VAR] = args.muse_settings
+        store_value = event.get("store")
+        store = Store(
+            str(store_value) if store_value else None,
+            agent=str(event.get("agent") or "hook"),
+        )
+        with _time_bound(store.config.write.hook_timeout_seconds):
+            response = handle(store, event)
+        if any(key in response for key in PRINTED_KEYS):
+            print(json.dumps(response))
+    except Exception:
+        _log(store, traceback.format_exc())
+    return EXIT_OK
+
+
+def handle(
+    store: Store,
+    event: dict[str, object],
+    launch: Launcher | None = None,
+    dream_launch: DreamLauncher | None = None,
+    drain_launch: DrainLauncher | None = None,
+) -> dict[str, object]:
+    host = str(event.get(KEY_HOST) or moments.HOST_CLAUDE_CODE)
+    raw_event = str(event.get(KEY_EVENT_CLAUDE) or event.get(KEY_EVENT_GENERIC) or "")
+    moment = moments.moment_for(host, raw_event)
+    if moment == moments.MOMENT_INJECT:
+        response = _inject(store, host)
+        (dream_launch or _launch_dream)(store, host)
+        _offer_drain(store, drain_launch)
+        return response
+    if moment in (moments.MOMENT_PAUSE, moments.MOMENT_EVICT):
+        return _boundary(
+            store,
+            event,
+            host,
+            moment,
+            launch or launch_distill,
+            dream_launch or _launch_dream,
+            drain_launch,
+        )
+    return {}
+
+
+def _offer_drain(store: Store, drain_launch: DrainLauncher | None) -> None:
+    if WriteJobs(store).due_count() == 0:
+        return
+    (drain_launch or _launch_drain)(store)
+
+
+def _inject(store: Store, host: str) -> dict[str, object]:
+    context = injection.payload(store)
+    if not context:
+        return {}
+    if host in (moments.HOST_CLAUDE_CODE, moments.HOST_CODEX):
+        return {
+            CLAUDE_OUTPUT_KEY: {
+                CLAUDE_EVENT_OUTPUT_KEY: "SessionStart",
+                CLAUDE_CONTEXT_KEY: context,
+            }
+        }
+    if host == moments.HOST_MUSE_CODE:
+        return {
+            CLAUDE_OUTPUT_KEY: {
+                CLAUDE_EVENT_OUTPUT_KEY: "SessionStart",
+                CLAUDE_CONTEXT_KEY: context,
+            }
+        }
+    return {CLAUDE_CONTEXT_KEY: context}
+
+
+def _boundary(
+    store: Store,
+    event: dict[str, object],
+    host: str,
+    moment: str,
+    launch: Launcher,
+    dream_launch: DreamLauncher,
+    drain_launch: DrainLauncher | None,
+) -> dict[str, object]:
+    session = str(event.get(KEY_SESSION) or "")
+    if not session:
+        return {}
+    items = _items(event)
+    result = capture_module.capture(store, session, items, source=moment)
+    if result.is_empty():
+        dream_launch(store, host)
+        _offer_drain(store, drain_launch)
+        return {}
+    launched = store.config.write.distill_on_boundary and launch(store, session, host)
+    return {
+        "moment": moment,
+        "session": session,
+        "pending": len(result.increment),
+        "archived": result.archived,
+        "pointer": result.pointer,
+        KEY_DISTILL: DISTILL_LAUNCHED if launched else DISTILL_SKIPPED,
+    }
+
+
+def _launch_dream(store: Store, _host: str) -> object:
+    from . import auto_dream
+
+    return auto_dream.launch(store, trigger_source="hook")
+
+
+def _launch_drain(store: Store) -> object:
+    from . import write_drain
+
+    return write_drain.launch(store)
+
+
+def launch_distill(store: Store, session: str, host: str) -> bool:
+    """The executor runs in its own process so the host's turn ends without waiting on it.
+
+    The request is first recorded as a Write job the queue can resume; the spawned worker
+    runs exactly that job. It reasons through the host that fired the boundary, and it is
+    marked as the executor so the hooks of its own host session do not start another
+    distillation."""
+    try:
+        job = WriteJobs(store).enqueue(session, host, trigger_source=TRIGGER_SOURCE_HOOK)
+    except OSError as exc:
+        _log(store, f"distill enqueue failed: {exc}")
+        return False
+    command = shlex.split(store.config.executor.command)
+    if not command:
+        return False
+    if command[0] == EXECUTOR_BINARY:
+        command[0] = detached.installed(EXECUTOR_BINARY)
+    environment = {**os.environ, STORE_ENV_VAR: str(store.root), EXECUTOR_ENV_VAR: "1"}
+    try:
+        store.layout.state_dir.mkdir(parents=True, exist_ok=True)
+        with (store.layout.state_dir / LOG_FILENAME).open("a", encoding="utf-8") as log:
+            subprocess.Popen(
+                [*command, JOB_FLAG, job.id, SOURCE_HOST_FLAG, host, AUTO_DREAM_FLAG],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                **detached.options(),
+            )
+    except OSError as exc:
+        _log(store, f"distill launch failed: {exc}")
+        return False
+    return True
+
+
+def _items(event: dict[str, object]) -> list[str]:
+    supplied = event.get(KEY_ITEMS)
+    if isinstance(supplied, list):
+        return [str(item) for item in supplied]
+    host = str(event.get(KEY_HOST) or "")
+    path = event.get(KEY_TRANSCRIPT)
+    if host == moments.HOST_MUSE_CODE and not path:
+        data_home = event.get(KEY_MUSE_DATA_HOME)
+        path = muse_session.path_for(
+            str(event.get(KEY_SESSION) or ""),
+            data_home=pathlib.Path(str(data_home)) if data_home else None,
+        )
+    found = transcript.items(pathlib.Path(str(path)), host=host) if path else []
+    if host == moments.HOST_MUSE_CODE and found:
+        final = str(event.get("last_assistant_message") or "").strip()
+        rendered = f"assistant: {final}" if final else ""
+        if rendered and rendered not in found:
+            found.append(rendered)
+    return found
+
+
+def normalize_event(event: object, host: str = "") -> dict[str, object]:
+    """Attach adapter identity while retaining fields used by the common hook model."""
+    if not isinstance(event, dict):
+        raise TypeError("hook payload must be a JSON object")
+    normalized = dict(event)
+    if host:
+        normalized[KEY_HOST] = host
+    return normalized
+
+
+def _raise_timeout(signum: int, frame: FrameType | None) -> None:
+    raise _Timeout()
+
+
+@contextlib.contextmanager
+def _time_bound(seconds: float) -> Iterator[None]:
+    """The POSIX interval timer also interrupts blocking calls; elsewhere a watchdog thread does."""
+    if sys.platform != "win32":
+        previous = signal.signal(signal.SIGALRM, _raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        return
+    previous = signal.signal(signal.SIGINT, _raise_timeout)
+    watchdog = threading.Timer(seconds, _thread.interrupt_main)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        yield
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+        signal.signal(signal.SIGINT, previous)
+
+
+def _log(store: Store | None, message: str) -> None:
+    if store is None:
+        return
+    try:
+        store.layout.state_dir.mkdir(parents=True, exist_ok=True)
+        with (store.layout.state_dir / LOG_FILENAME).open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+    except OSError:
+        return
+
+
+def cli() -> int:
+    return main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

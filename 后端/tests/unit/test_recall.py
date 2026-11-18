@@ -1,0 +1,248 @@
+"""M3 — eligibility before relevance; reads never touch truth."""
+
+import hashlib
+
+from agent_memory.core.access_log import KIND_READ, AccessEntry, AccessLog
+from agent_memory.core.database import Database
+from agent_memory.core.recall import Recall, access_boost
+from agent_memory.core.schema import MemorySchema, render
+from agent_memory.core.store import LEVEL_ABSTRACT, LEVEL_OUTLINE, Store
+
+
+def _names(hits):
+    return [hit.name for hit in hits]
+
+
+def test_literal_tokens_such_as_error_codes_are_retrievable(seeded):
+    hits = Recall(seeded).recall("E4021")
+    assert "staging-deploy-e4021" in _names(hits)
+
+
+def test_paraphrase_of_the_abstract_retrieves_the_record(seeded):
+    hits = Recall(seeded).recall("deploy fails when the queue drains")
+    assert "staging-deploy-e4021" in _names(hits)
+
+
+def test_superseded_records_are_excluded_before_relevance_is_considered(seeded):
+    seeded.record(
+        abstract="The staging deploy now fails with error E4021 only under load",
+        type="experience",
+        name="staging-deploy-e4021-under-load",
+        valid_from="2026-01-10",
+    )
+    seeded.correct("staging-deploy-e4021", supersede_with="staging-deploy-e4021-under-load")
+
+    hits = Recall(seeded).recall("E4021")
+    assert "staging-deploy-e4021" not in _names(hits)
+    assert "staging-deploy-e4021-under-load" in _names(hits)
+
+
+def test_as_of_walks_back_up_the_supersede_chain(seeded):
+    seeded.record(
+        abstract="The staging deploy now fails with error E4021 only under load",
+        type="experience",
+        name="staging-deploy-e4021-under-load",
+        valid_from="2026-02-01",
+    )
+    seeded.correct("staging-deploy-e4021", supersede_with="staging-deploy-e4021-under-load")
+
+    before = Recall(seeded).recall("E4021", as_of="2026-01-20")
+    after = Recall(seeded).recall("E4021", as_of="2026-02-05")
+    assert "staging-deploy-e4021" in _names(before)
+    assert "staging-deploy-e4021-under-load" not in _names(before)
+    assert "staging-deploy-e4021-under-load" in _names(after)
+
+
+def test_a_deleted_record_leaves_the_default_surface_but_not_the_past(seeded, clock):
+    clock.advance(days=1)
+    seeded.delete("staging-deploy-e4021")
+    assert "staging-deploy-e4021" not in _names(Recall(seeded).recall("E4021"))
+    earlier = Recall(seeded).recall("E4021", as_of="2026-01-15T12:00:00Z")
+    assert "staging-deploy-e4021" in _names(earlier)
+
+
+def test_scope_restricts_by_path_prefix(seeded):
+    hits = Recall(seeded).recall("deploy queue drain answers", scope="experience")
+    assert hits
+    assert {hit.type for hit in hits} == {"experience"}
+
+
+def test_scope_matches_a_complete_path_component(store):
+    extra = MemorySchema(
+        type="experience-archive",
+        description="Archived experiences used to test a colliding scope prefix.",
+        key=("subject",),
+    )
+    store.schemas.path_for(extra.type).write_text(render(extra), encoding="utf-8")
+    store.record(
+        abstract="Shared scope marker in the active experience domain",
+        type="experience",
+        name="active-scope-marker",
+    )
+    store.record(
+        abstract="Shared scope marker in the archive domain",
+        type=extra.type,
+        fields={"subject": "archive-scope-marker"},
+    )
+
+    hits = Recall(store).recall("shared scope marker", scope="experience")
+
+    assert _names(hits) == ["active-scope-marker"]
+
+
+def test_scope_filters_matches_before_the_candidate_pool_is_truncated(store):
+    pool = store.config.recall.candidate_pool_multiplier
+    specs = [
+        {
+            "abstract": "scopeprobe scopeprobe scopeprobe",
+            "type": "decision",
+            "fields": {"project": "outside"},
+            "name": f"outside-{index}",
+        }
+        for index in range(pool + 1)
+    ]
+    specs.append(
+        {
+            "abstract": "scopeprobe",
+            "type": "decision",
+            "fields": {"project": "inside"},
+            "name": "inside-scopeprobe",
+        }
+    )
+    assert not store.record_many(specs).rejected
+
+    hits = Recall(store).recall("scopeprobe", scope="decision/inside", limit=1)
+
+    assert _names(hits) == ["inside-scopeprobe"]
+
+
+def test_scope_applies_to_historical_candidates(store, clock):
+    store.record(
+        abstract="scopehistory",
+        type="decision",
+        fields={"project": "inside"},
+        name="inside-scopehistory",
+    )
+    clock.advance(days=1)
+    store.delete("inside-scopehistory")
+
+    hits = Recall(store).recall(
+        "scopehistory", scope="decision/inside", as_of="2026-01-15T09:00:00Z"
+    )
+
+    assert _names(hits) == ["inside-scopehistory"]
+
+
+def test_l0_entries_carry_the_full_contract(seeded):
+    hit = Recall(seeded).recall("E4021")[0]
+    payload = hit.as_dict()
+    for key in ("name", "path", "abstract", "anchor", "score", "weight", "relevance", "recency"):
+        assert key in payload
+    assert hit.score > 0
+
+
+def test_weight_reorders_two_otherwise_comparable_hits(seeded):
+    seeded.record(
+        abstract="Deploy notes for the drain window, second copy",
+        type="experience",
+        name="drain-notes-b",
+    )
+    seeded.record(
+        abstract="Deploy notes for the drain window, first copy",
+        type="experience",
+        name="drain-notes-a",
+    )
+    baseline = _names(Recall(seeded).recall("deploy notes drain window"))
+    before = seeded.find("drain-notes-b").weight
+    seeded.feedback("drain-notes-b", seeded.config.weight.boost_step)
+    reopened = Store(seeded.root, config=seeded.config, clock=seeded.clock)
+    boosted = _names(Recall(reopened).recall("deploy notes drain window"))
+    assert baseline.index("drain-notes-a") < baseline.index("drain-notes-b")
+    assert boosted.index("drain-notes-b") < boosted.index("drain-notes-a")
+    assert reopened.find("drain-notes-b").weight == before + seeded.config.weight.boost_step
+
+
+def test_recall_writes_the_access_log_and_leaves_truth_bytes_untouched(seeded):
+    before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in seeded.layout.truth_files()
+    }
+    hits = Recall(seeded).recall("deploy queue drain")
+    seeded.read("staging-deploy-e4021", level=LEVEL_ABSTRACT)
+    after = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in seeded.layout.truth_files()
+    }
+    assert after == before
+
+    with Database(seeded.layout).connect() as connection:
+        entries = AccessLog(connection).entries()
+    assert len(entries) >= len(hits) + 1
+
+
+def test_limit_is_respected(seeded):
+    assert len(Recall(seeded).recall("deploy queue drain answers memory", limit=1)) == 1
+
+
+def test_progressive_disclosure_levels_cost_more_the_deeper_they_go(seeded):
+    abstract = seeded.read("staging-deploy-e4021", level=LEVEL_ABSTRACT)
+    outline = seeded.read("staging-deploy-e4021", level=LEVEL_OUTLINE)
+    full = seeded.read("staging-deploy-e4021")
+    assert outline.outline == ("Symptom", "Cause", "Fix")
+    assert len(abstract.text) < len(full.text)
+    assert len(outline.text) < len(full.text)
+
+
+def test_a_hit_in_a_long_body_carries_the_section_anchor(seeded):
+    hits = Recall(seeded).recall("lease TTL drain timeout infra queue yaml")
+    hit = next(hit for hit in hits if hit.name == "staging-deploy-e4021")
+    assert hit.anchor == "fix"
+
+
+def test_the_recall_list_length_is_a_knob(seeded):
+    for index in range(seeded.config.recall.default_limit * 2):
+        seeded.record(
+            abstract=f"Evening habit number {index}: reading, tea, and an early night",
+            type="preference",
+            name=f"evening-habit-{index}",
+        )
+    narrow = Recall(seeded).recall("evening habits reading tea")
+    seeded.config.recall.default_limit *= 2
+    wide = Recall(seeded).recall("evening habits reading tea")
+    assert len(wide) > len(narrow)
+    assert {hit.name for hit in narrow} <= {hit.name for hit in wide}
+
+
+def test_enhanced_time_travel_uses_only_accesses_at_or_before_the_requested_instant(store, clock):
+    store.record(name="frozen-note", type="fact", abstract="Frozen calibration window")
+    with Database(store.layout).connect() as connection:
+        AccessLog(connection).append(
+            [
+                AccessEntry(when, "frozen-note", "", KIND_READ, "auditor")
+                for when in ("2026-01-15T17:00:00.000001+08:00", "2026-01-15T09:00:00.000002Z")
+            ]
+        )
+    recall = Recall(store)
+    before = recall.recall_enhanced("calibration", as_of="2026-01-15T09:00:00Z", log=False)
+    exact = recall.recall_enhanced("calibration", as_of="2026-01-15T09:00:00.000001Z", log=False)
+    assert before.hits[0].access_boost == access_boost(0)
+    assert exact.hits[0].access_boost == access_boost(1)
+    assert recall.recall_enhanced("calibration", log=False).hits[0].access_boost == access_boost(0)
+    clock.advance(microseconds=2)
+    assert recall.recall_enhanced("calibration", log=False).hits[0].access_boost == access_boost(2)
+
+
+def test_enhanced_eligibility_includes_start_and_excludes_same_instant_end(store):
+    store.record(
+        name="old-threshold", type="fact", abstract="Calibration threshold", valid_from="2025-01-01"
+    )
+    store.record(
+        name="new-threshold", type="fact", abstract="Calibration threshold",
+        valid_from="2025-06-01", supersedes="old-threshold",
+    )
+    for moment, expected in (
+        ("2024-12-31T23:59:59.999999Z", []),
+        ("2025-01-01", ["old-threshold"]),
+        ("2025-05-31T23:59:59.999999Z", ["old-threshold"]),
+        ("2025-06-01T08:00:00+08:00", ["new-threshold"]),
+    ):
+        result = Recall(store).recall_enhanced("calibration", as_of=moment, log=False)
+        assert [item.hit.name for item in result.hits] == expected

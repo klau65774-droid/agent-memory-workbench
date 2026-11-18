@@ -1,0 +1,13 @@
+benchmarks/
+.claude/worktrees/
+.index/
+.state/
+/.demo_stores/
+.env
+.venv/
+__pycache__/
+*.pyc
+.coverage
+# The experiment tree stays on disk and stays the evidence; it no longer enters git history.
+experiments/
+docs/

@@ -1,0 +1,64 @@
+[project]
+name = "agent-memory-workspace"
+version = "0.1.0"
+description = "Agent-agnostic, local-first long-term memory runtime"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "agent-memory-core",
+    "agent-memory-cli",
+    "agent-memory-adapters",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "pydantic>=2.10.0",
+    "httpx>=0.28.0",
+]
+
+[project.optional-dependencies]
+mcp = ["agent-memory-mcp"]
+executor = ["agent-memory-executor"]
+harness = ["agent-memory-harness"]
+vector = ["agent-memory-core[vector]"]
+cjk = ["agent-memory-core[cjk]"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+agent-memory-core = { workspace = true }
+agent-memory-cli = { workspace = true }
+agent-memory-mcp = { workspace = true }
+agent-memory-adapters = { workspace = true }
+agent-memory-executor = { workspace = true }
+agent-memory-harness = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "stress: performance budgets, run on release",
+    "redteam: adversarial cases, gate before release",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "packages/core/src:packages/cli/src:packages/adapters/src:packages/mcp/src:packages/executor/src:packages/harness/src"
+files = ["packages"]
+ignore_missing_imports = true

@@ -1,0 +1,292 @@
+"""The reconcile sheet: what the store already knows, handed to the executor before it writes.
+
+Handles are the only way an operation may name an existing memory, and the sheet is the only
+place handles come from. A write that names anything else is rejected before it reaches the
+store, so an executor steered by the conversation can at most write a new file.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+
+from . import timestamp
+from .config import Config
+from .errors import FieldError
+from .paths import StoreLayout
+from .recall import Recall
+from .record import MemoryRecord
+from .schema import MemorySchema
+from .sessions import Message, Pointer, parse_pointer, render_pointer
+from .store import Store
+
+OP_NEW = "new"
+OP_SUPERSEDE = "supersede"
+OP_UPDATE = "update"
+OP_SKIP = "skip"
+OPS = (OP_NEW, OP_SUPERSEDE, OP_UPDATE, OP_SKIP)
+OP_ALIASES = {
+    "insert": OP_NEW,
+    "create": OP_NEW,
+    "add": OP_NEW,
+    "write": OP_NEW,
+    "replace": OP_SUPERSEDE,
+    "edit": OP_UPDATE,
+    "patch": OP_UPDATE,
+    "ignore": OP_SKIP,
+    "none": OP_SKIP,
+}
+KEY_OP = "op"
+KEY_HANDLE = "handle"
+KEY_SUPERSEDES = "supersedes"
+KEY_PROVENANCE = "provenance"
+KEY_VALID_FROM = "valid_from"
+KEY_TYPE = "type"
+KEY_GROUP = "group"
+KEY_FIELDS = "fields"
+FENCE = "```"
+TYPE_PROFILE = "profile"
+RANGE_SEPARATOR = "-"
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+UNCHECKED_KEYS = (KEY_OP, KEY_HANDLE, KEY_PROVENANCE)
+
+
+@dataclasses.dataclass(frozen=True)
+class Handle:
+    name: str
+    type: str
+    status: str
+    valid_from: str
+    abstract: str
+
+    def render(self) -> str:
+        return f"- {self.name} [{self.type}, since {self.valid_from}]: {self.abstract}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Sheet:
+    session: str
+    pointer: Pointer
+    handles: tuple[Handle, ...]
+    menus: dict[str, tuple[str, ...]]
+    profile: tuple[str, ...]
+    slots: tuple[MemorySchema, ...]
+    messages: tuple[Message, ...] = ()
+
+    def handle_names(self) -> set[str]:
+        return {handle.name for handle in self.handles}
+
+    def render(self) -> str:
+        lines = ["## Existing memories this conversation may touch"]
+        lines.extend(handle.render() for handle in self.handles)
+        if not self.handles:
+            lines.append("- (none found)")
+        lines.append("")
+        lines.append("## Existing groups, per type")
+        for type_name, groups in sorted(self.menus.items()):
+            lines.append(f"- {type_name}: {', '.join(groups) if groups else '(none yet)'}")
+        lines.append("")
+        lines.append("## Who this is about")
+        lines.extend(f"- {line}" for line in self.profile)
+        if not self.profile:
+            lines.append("- (no profile yet)")
+        return "\n".join(lines)
+
+
+def build(store: Store, session: str, messages: list[Message]) -> Sheet:
+    config: Config = store.config
+    text = " ".join(message.text for message in messages)[: config.write.reconcile_query_chars]
+    hits = (
+        Recall(store).recall(text, limit=config.write.reconcile_entries, log=False) if text else []
+    )
+    handles = tuple(
+        Handle(hit.name, hit.type, hit.status, hit.updated, hit.abstract) for hit in hits
+    )
+    layout: StoreLayout = store.layout
+    schemas = tuple(store.schemas.all())
+    menus = {
+        schema.type: tuple(sorted(layout.groups_of(schema.type)))
+        for schema in schemas
+        if schema.group
+    }
+    profile = tuple(record.abstract for record in store.records() if record.type == TYPE_PROFILE)
+    first = messages[0].index if messages else 0
+    last = messages[-1].index if messages else first
+    return Sheet(
+        session, Pointer(session, first, last), handles, menus, profile, schemas, tuple(messages)
+    )
+
+
+def parse_operations(reply: str) -> tuple[list[dict[str, object]], list[FieldError]]:
+    """Extract every JSON object the reply carries.
+
+    Models may answer with one object per line, several objects inside a single
+    markdown code fence, or pretty-printed objects that span lines. Walking the
+    text with a JSON decoder accepts all of those instead of splitting lines.
+    A span that is not JSON is reported, never guessed at.
+    """
+    specs: list[dict[str, object]] = []
+    errors: list[FieldError] = []
+    text, dropped = _unwrap_fences(reply)
+    decoder = json.JSONDecoder()
+    idx = 0
+    n = len(text)
+    while idx < n:
+        while idx < n and text[idx] in " \t\r\n":
+            idx += 1
+        if idx >= n:
+            break
+        line_no = text.count("\n", 0, idx) + 1 + dropped
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            errors.append(FieldError(f"line {line_no}", "not a JSON object"))
+            nl = text.find("\n", idx)
+            idx = n if nl == -1 else nl + 1
+            continue
+        if isinstance(obj, dict):
+            specs.append(obj)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    specs.append(item)
+        else:
+            errors.append(FieldError(f"line {line_no}", "not a JSON object"))
+        idx = end
+    return specs, errors
+
+
+def _unwrap_fences(text: str) -> tuple[str, int]:
+    """Drop a single surrounding markdown code fence, if the reply has one.
+
+    Returns the unwrapped text and how many leading lines were removed, so callers
+    can report line numbers against the original reply.
+    """
+    stripped = text.strip()
+    if not stripped.startswith(FENCE):
+        return stripped, 0
+    dropped = 1  # the opening fence line (``` possibly with a language tag)
+    nl = stripped.find("\n")
+    if nl != -1:
+        stripped = stripped[nl + 1 :]
+    if stripped.rstrip().endswith(FENCE):
+        stripped = stripped.rstrip()[: -len(FENCE)].rstrip()
+    return stripped, dropped
+
+
+def operation_of(spec: dict[str, object]) -> str:
+    """A near-synonym the executor reached for is read as the verb it meant."""
+    raw = str(spec.get(KEY_OP) or OP_NEW).strip().lower()
+    return OP_ALIASES.get(raw, raw)
+
+
+def check(spec: dict[str, object], sheet: Sheet) -> list[FieldError]:
+    """Handles must come from the sheet; provenance defaults to the batch it came from."""
+    errors: list[FieldError] = []
+    op = operation_of(spec)
+    if op not in OPS:
+        errors.append(FieldError(KEY_OP, f"must be one of {', '.join(OPS)}"))
+        return errors
+    handle = str(spec.get(KEY_HANDLE) or spec.get(KEY_SUPERSEDES) or "")
+    if op in (OP_SUPERSEDE, OP_UPDATE):
+        if not handle:
+            errors.append(FieldError(KEY_HANDLE, f"{op} names an existing memory"))
+        elif handle not in sheet.handle_names():
+            errors.append(FieldError(KEY_HANDLE, f"{handle} is not on the reconcile sheet"))
+    if op == OP_NEW and handle and handle in sheet.handle_names():
+        errors.append(FieldError(KEY_HANDLE, f"{handle} exists; use update or supersede"))
+    if op != OP_SKIP:
+        errors.extend(_unsupported_addresses(spec, sheet))
+    return errors
+
+
+def _restates_a_field(spec: dict[str, object]) -> bool:
+    """Executors echo the group field's value under a bare group key; the echo carries nothing."""
+    group = spec.get(KEY_GROUP)
+    fields = spec.get(KEY_FIELDS)
+    if not isinstance(group, str) or not isinstance(fields, dict):
+        return False
+    return group.strip().lower() in {str(value).strip().lower() for value in fields.values()}
+
+
+def _unsupported_addresses(spec: dict[str, object], sheet: Sheet) -> list[FieldError]:
+    """An address is an identity: it is written only when the evidence itself states it.
+
+    The host session that reasons can see its own account's address, and it was observed
+    attributing that address to the user."""
+    evidence = "\n".join([sheet.render(), *(message.text for message in sheet.messages)])
+    known = set(EMAIL.findall(evidence))
+    errors = []
+    for key, value in spec.items():
+        if key in UNCHECKED_KEYS:
+            continue
+        rendered = value if isinstance(value, str) else json.dumps(value)
+        stray = sorted(set(EMAIL.findall(rendered)) - known)
+        if stray:
+            errors.append(
+                FieldError(key, f"{', '.join(stray)} appears nowhere in the conversation")
+            )
+    return errors
+
+
+def to_record_spec(spec: dict[str, object], sheet: Sheet) -> dict[str, object] | None:
+    """The executor's operation, as the store's single write path takes it. Skip is nothing."""
+    op = operation_of(spec)
+    if op == OP_SKIP:
+        return None
+    handle = str(spec.get(KEY_HANDLE) or spec.get(KEY_SUPERSEDES) or "")
+    record_spec = {key: value for key, value in spec.items() if key not in (KEY_OP, KEY_HANDLE)}
+    if _restates_a_field(record_spec):
+        record_spec.pop(KEY_GROUP)
+    if op == OP_SUPERSEDE:
+        record_spec[KEY_SUPERSEDES] = handle
+    elif op == OP_UPDATE:
+        record_spec["name"] = handle
+        record_spec.pop(KEY_SUPERSEDES, None)
+    else:
+        record_spec.pop(KEY_SUPERSEDES, None)
+    pointers = _provenance(spec.get(KEY_PROVENANCE), sheet)
+    record_spec[KEY_PROVENANCE] = [render_pointer(pointer) for pointer in pointers]
+    if not record_spec.get(KEY_VALID_FROM):
+        evidence_time = _latest_cited_time(pointers, sheet)
+        if evidence_time:
+            record_spec[KEY_VALID_FROM] = evidence_time
+    return record_spec
+
+
+def _latest_cited_time(pointers: list[Pointer], sheet: Sheet) -> str:
+    """The library dates a memory by its evidence when the executor gives no date of its own."""
+    stamps = [
+        message.at
+        for message in sheet.messages
+        if message.at
+        and any(
+            pointer.session == sheet.session and pointer.start <= message.index <= pointer.end
+            for pointer in pointers
+        )
+    ]
+    return max(stamps, key=timestamp.parse) if stamps else ""
+
+
+def _provenance(raw: object, sheet: Sheet) -> list[Pointer]:
+    items = raw if isinstance(raw, list) else ([raw] if raw else [])
+    pointers: list[Pointer] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        start, separator, end = text.partition(RANGE_SEPARATOR)
+        if start.isdigit() and (end.isdigit() or not separator):
+            pointers.append(
+                Pointer(sheet.session, int(start), int(end) if end.isdigit() else int(start))
+            )
+        else:
+            parsed = parse_pointer(text)
+            if parsed:
+                pointers.append(parsed)
+    return pointers or [sheet.pointer]
+
+
+def profile_lines(records: list[MemoryRecord]) -> tuple[str, ...]:
+    return tuple(record.abstract for record in records if record.type == TYPE_PROFILE)
